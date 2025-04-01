@@ -1,100 +1,142 @@
 <?php
 session_start(); // Start session
 
+// Afficher les erreurs pour le débogage (à commenter en production)
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
 // Vérifier si l'utilisateur est connecté
 if (!isset($_SESSION['username']) || !isset($_SESSION['user_id'])) {
     header("Location: expired");  // Redirige vers la page de connexion si non connecté
     exit();
 }
 
-// Increase limits for large file operations
-ini_set('memory_limit', '512M');
-ini_set('max_execution_time', 600);
-ini_set('output_buffering', 'Off');
-ini_set('zlib.output_compression', 'Off');
-
 // Database Connection
 $host = 'localhost';
 $user = 'root';
 $pass = 'root';
 $dbname = 'cloudbox';
-$conn = new mysqli($host, $user, $pass, $dbname);
-if ($conn->connect_error) die("Database connection failed: " . $conn->connect_error);
-$conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, 60);
+
+try {
+    $conn = new mysqli($host, $user, $pass, $dbname);
+    if ($conn->connect_error) {
+        throw new Exception("Database connection failed: " . $conn->connect_error);
+    }
+} catch (Exception $e) {
+    die("Connection error: " . $e->getMessage());
+}
 
 $username = $_SESSION['username'];
 $userid = $_SESSION['user_id'];
 $messages = [];
 
+// Vérifier si la table 'folders' existe
+$folderTableExists = false;
+$result = $conn->query("SHOW TABLES LIKE 'folders'");
+if ($result && $result->num_rows > 0) {
+    $folderTableExists = true;
+}
+
+// Vérifier si la colonne folder_id existe dans la table files
+$folderIdColumnExists = false;
+if ($folderTableExists) {
+    $result = $conn->query("SHOW COLUMNS FROM files LIKE 'folder_id'");
+    if ($result && $result->num_rows > 0) {
+        $folderIdColumnExists = true;
+    } else {
+        // Tenter d'ajouter la colonne si elle n'existe pas
+        try {
+            $conn->query("ALTER TABLE files ADD COLUMN folder_id INT DEFAULT NULL");
+            $folderIdColumnExists = true;
+            $messages[] = "<p class='info-message'>Added folder_id column to files table.</p>";
+        } catch (Exception $e) {
+            $messages[] = "<p class='error-message'>Error adding folder_id column: " . $e->getMessage() . "</p>";
+        }
+    }
+}
+
 // Récupérer l'ID du dossier courant (si spécifié dans l'URL)
 $current_folder_id = isset($_GET['folder_id']) ? intval($_GET['folder_id']) : null;
 
-// Créer un nouveau dossier
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['new_folder_name'])) {
+// Créer un nouveau dossier - uniquement si la table folders existe
+if ($folderTableExists && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['new_folder_name'])) {
     $folder_name = $conn->real_escape_string(trim($_POST['new_folder_name']));
     
     if (!empty($folder_name)) {
-        // Vérifier si un dossier avec le même nom existe déjà au même niveau
-        $checkStmt = $conn->prepare("SELECT id FROM folders WHERE user_id = ? AND folder_name = ? AND parent_folder_id " . ($current_folder_id ? "= ?" : "IS NULL"));
-        
-        if ($current_folder_id) {
-            $checkStmt->bind_param("isi", $userid, $folder_name, $current_folder_id);
-        } else {
-            $checkStmt->bind_param("is", $userid, $folder_name);
-        }
-        
-        $checkStmt->execute();
-        $checkStmt->store_result();
-        
-        if ($checkStmt->num_rows > 0) {
-            $messages[] = "<p id='folder-message' class='error-message'>Un dossier avec ce nom existe déjà à cet emplacement.</p>";
-        } else {
-            // Insérer le nouveau dossier
-            $stmt = $conn->prepare("INSERT INTO folders (user_id, folder_name, parent_folder_id) VALUES (?, ?, ?)");
-            $stmt->bind_param("isi", $userid, $folder_name, $current_folder_id);
+        try {
+            // Vérifier si un dossier avec le même nom existe déjà au même niveau
+            $checkStmt = $conn->prepare("SELECT id FROM folders WHERE user_id = ? AND folder_name = ? AND parent_folder_id " . ($current_folder_id ? "= ?" : "IS NULL"));
             
-            if ($stmt->execute()) {
-                $messages[] = "<p id='folder-message' class='success-message'>Dossier créé avec succès!</p>";
+            if ($current_folder_id) {
+                $checkStmt->bind_param("isi", $userid, $folder_name, $current_folder_id);
             } else {
-                $messages[] = "<p id='folder-message' class='error-message'>Erreur lors de la création du dossier: " . $conn->error . "</p>";
+                $checkStmt->bind_param("is", $userid, $folder_name);
             }
+            
+            $checkStmt->execute();
+            $checkStmt->store_result();
+            
+            if ($checkStmt->num_rows > 0) {
+                $messages[] = "<p id='folder-message' class='error-message'>A folder with this name already exists at this location.</p>";
+            } else {
+                // Insérer le nouveau dossier
+                $stmt = $conn->prepare("INSERT INTO folders (user_id, folder_name, parent_folder_id) VALUES (?, ?, ?)");
+                $stmt->bind_param("isi", $userid, $folder_name, $current_folder_id);
+                
+                if ($stmt->execute()) {
+                    $messages[] = "<p id='folder-message' class='success-message'>Folder created successfully!</p>";
+                } else {
+                    throw new Exception($conn->error);
+                }
+            }
+        } catch (Exception $e) {
+            $messages[] = "<p id='folder-message' class='error-message'>Error creating folder: " . $e->getMessage() . "</p>";
         }
     } else {
-        $messages[] = "<p id='folder-message' class='error-message'>Veuillez entrer un nom de dossier valide.</p>";
+        $messages[] = "<p id='folder-message' class='error-message'>Please enter a valid folder name.</p>";
     }
 }
 
 // Get user's quota information
-$quotaStmt = $conn->prepare("SELECT storage_quota FROM users WHERE id = ?");
-$quotaStmt->bind_param("i", $userid);
-$quotaStmt->execute();
-$quotaStmt->bind_result($storage_quota);
-$quotaStmt->fetch();
-$quotaStmt->close();
-
-// Get user's current storage usage
-$usageStmt = $conn->prepare("SELECT SUM(file_size) as total_usage FROM files WHERE user_id = ?");
-$usageStmt->bind_param("i", $userid);
-$usageStmt->execute();
-$usageStmt->bind_result($total_usage);
-$usageStmt->fetch();
-$usageStmt->close();
-
-// Default quota if not set
-if (!$storage_quota) {
+try {
     $storage_quota = 104857600; // 100MB default
+    $quotaStmt = $conn->prepare("SELECT storage_quota FROM users WHERE id = ?");
+    if ($quotaStmt) {
+        $quotaStmt->bind_param("i", $userid);
+        $quotaStmt->execute();
+        $quotaStmt->bind_result($quota);
+        if ($quotaStmt->fetch() && $quota) {
+            $storage_quota = $quota;
+        }
+        $quotaStmt->close();
+    }
+} catch (Exception $e) {
+    // Continue with default quota
 }
 
-// Default usage if not set
-if (!$total_usage) {
+// Get user's current storage usage
+try {
     $total_usage = 0;
+    $usageStmt = $conn->prepare("SELECT SUM(file_size) as total_usage FROM files WHERE user_id = ?");
+    if ($usageStmt) {
+        $usageStmt->bind_param("i", $userid);
+        $usageStmt->execute();
+        $usageStmt->bind_result($usage);
+        if ($usageStmt->fetch() && $usage) {
+            $total_usage = $usage;
+        }
+        $usageStmt->close();
+    }
+} catch (Exception $e) {
+    // Continue with default usage
 }
 
 // Calculate percentage
 $usage_percentage = ($storage_quota > 0) ? ($total_usage / $storage_quota) * 100 : 0;
 
 // Handle File Upload with Duplicate Check and Quota Check
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file']) && $_FILES['file']['error'] == 0) {
     $filename = $_FILES['file']['name'];
     $file_tmp = $_FILES['file']['tmp_name'];
     $file_size = $_FILES['file']['size'];
@@ -106,118 +148,140 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
             number_format($storage_quota / 1048576, 2) . "MB and you're using " . 
             number_format($total_usage / 1048576, 2) . "MB. Please delete some files or contact administrator.</p>";
     } else {
-        // Check if file already exists for the user in the current folder
-        $checkStmt = $conn->prepare("SELECT id FROM files WHERE user_id = ? AND filename = ? AND folder_id " . ($current_folder_id ? "= ?" : "IS NULL"));
-        
-        if ($current_folder_id) {
-            $checkStmt->bind_param("isi", $userid, $filename, $current_folder_id);
-        } else {
-            $checkStmt->bind_param("is", $userid, $filename);
-        }
-        
-        $checkStmt->execute();
-        $checkStmt->store_result();
-
-        if ($checkStmt->num_rows > 0) {
-            $messages[] = "<p id='upload-message' class='error-message'>File already exists in this folder.</p>";
-        } else {
-            // Read the file content
-            $file_content = file_get_contents($file_tmp);
-
-            // Insert file metadata into the `files` table with folder_id
-            $insertStmt = $conn->prepare("INSERT INTO files (user_id, filename, file_size, file_type, folder_id) VALUES (?, ?, ?, ?, ?)");
-            $insertStmt->bind_param("isiss", $userid, $filename, $file_size, $file_type, $current_folder_id);
+        try {
+            // Check if file already exists for the user
+            $checkQuery = "SELECT id FROM files WHERE user_id = ? AND filename = ?";
+            $params = [$userid, $filename];
+            $types = "is";
             
-            if ($insertStmt->execute()) {
-                $file_id = $insertStmt->insert_id;
-
-                // Insert file content into the `file_content` table
-                $contentStmt = $conn->prepare("INSERT INTO file_content (file_id, content) VALUES (?, ?)");
-                $contentStmt->bind_param("is", $file_id, $file_content);
-                
-                if ($contentStmt->execute()) {
-                    // Update total usage for display
-                    $total_usage += $file_size;
-                    $usage_percentage = ($total_usage / $storage_quota) * 100;
-                    $messages[] = "<p id='upload-message' class='success-message'>File uploaded successfully.</p>";
-                } else {
-                    $messages[] = "<p id='upload-message' class='error-message'>Error saving file content: " . $conn->error . "</p>";
+            // Add folder condition if folder_id column exists
+            if ($folderIdColumnExists) {
+                $checkQuery .= " AND folder_id " . ($current_folder_id ? "= ?" : "IS NULL");
+                if ($current_folder_id) {
+                    $params[] = $current_folder_id;
+                    $types .= "i";
                 }
-            } else {
-                $messages[] = "<p id='upload-message' class='error-message'>Error saving file metadata: " . $conn->error . "</p>";
             }
+            
+            $checkStmt = $conn->prepare($checkQuery);
+            $checkStmt->bind_param($types, ...$params);
+            $checkStmt->execute();
+            $checkStmt->store_result();
+
+            if ($checkStmt->num_rows > 0) {
+                $messages[] = "<p id='upload-message' class='error-message'>File already exists in this location.</p>";
+            } else {
+                // Read the file content
+                $file_content = file_get_contents($file_tmp);
+
+                // Prepare insert query based on whether folder_id column exists
+                if ($folderIdColumnExists) {
+                    $insertStmt = $conn->prepare("INSERT INTO files (user_id, filename, file_size, file_type, folder_id) VALUES (?, ?, ?, ?, ?)");
+                    $insertStmt->bind_param("isiss", $userid, $filename, $file_size, $file_type, $current_folder_id);
+                } else {
+                    $insertStmt = $conn->prepare("INSERT INTO files (user_id, filename, file_size, file_type) VALUES (?, ?, ?, ?)");
+                    $insertStmt->bind_param("isis", $userid, $filename, $file_size, $file_type);
+                }
+                
+                if ($insertStmt->execute()) {
+                    $file_id = $insertStmt->insert_id;
+
+                    // Insert file content into the `file_content` table
+                    $contentStmt = $conn->prepare("INSERT INTO file_content (file_id, content) VALUES (?, ?)");
+                    $contentStmt->bind_param("is", $file_id, $file_content);
+                    
+                    if ($contentStmt->execute()) {
+                        // Update total usage for display
+                        $total_usage += $file_size;
+                        $usage_percentage = ($total_usage / $storage_quota) * 100;
+                        $messages[] = "<p id='upload-message' class='success-message'>File uploaded successfully.</p>";
+                    } else {
+                        throw new Exception("Error saving file content: " . $conn->error);
+                    }
+                } else {
+                    throw new Exception("Error saving file metadata: " . $conn->error);
+                }
+            }
+        } catch (Exception $e) {
+            $messages[] = "<p id='upload-message' class='error-message'>" . $e->getMessage() . "</p>";
         }
     }
 }
-
-// Handle File Download (géré par download.php)
 
 // Handle File Deletion
 if (isset($_GET['delete_id']) && is_numeric($_GET['delete_id'])) {
     $delete_id = intval($_GET['delete_id']);
     
-    // Get file size before deletion to update usage display
-    $sizeStmt = $conn->prepare("SELECT file_size FROM files WHERE id = ? AND user_id = ?");
-    $sizeStmt->bind_param("ii", $delete_id, $userid);
-    $sizeStmt->execute();
-    $sizeStmt->bind_result($file_size);
-    $sizeStmt->fetch();
-    $sizeStmt->close();
-    
-    $deleteStmt = $conn->prepare("DELETE FROM files WHERE id = ? AND user_id = ?");
-    $deleteStmt->bind_param("ii", $delete_id, $userid);
-    if ($deleteStmt->execute()) {
-        // Update total usage for display if file was deleted
-        if ($file_size) {
-            $total_usage -= $file_size;
-            if ($total_usage < 0) $total_usage = 0;
-            $usage_percentage = ($total_usage / $storage_quota) * 100;
+    try {
+        // Get file size before deletion to update usage display
+        $sizeStmt = $conn->prepare("SELECT file_size FROM files WHERE id = ? AND user_id = ?");
+        $sizeStmt->bind_param("ii", $delete_id, $userid);
+        $sizeStmt->execute();
+        $sizeStmt->bind_result($file_size);
+        $sizeStmt->fetch();
+        $sizeStmt->close();
+        
+        $deleteStmt = $conn->prepare("DELETE FROM files WHERE id = ? AND user_id = ?");
+        $deleteStmt->bind_param("ii", $delete_id, $userid);
+        if ($deleteStmt->execute()) {
+            // Update total usage for display if file was deleted
+            if ($file_size) {
+                $total_usage -= $file_size;
+                if ($total_usage < 0) $total_usage = 0;
+                $usage_percentage = ($total_usage / $storage_quota) * 100;
+            }
+            $messages[] = "<p id='delete-message' class='success-message'>File deleted successfully.</p>";
+        } else {
+            throw new Exception("Error deleting file: " . $conn->error);
         }
-        $messages[] = "<p id='delete-message' class='success-message'>File deleted successfully.</p>";
-    } else {
-        $messages[] = "<p id='delete-message' class='error-message'>Error deleting file: " . $conn->error . "</p>";
+    } catch (Exception $e) {
+        $messages[] = "<p id='delete-message' class='error-message'>" . $e->getMessage() . "</p>";
     }
 }
 
-// Supprimer un dossier
-if (isset($_GET['delete_folder']) && is_numeric($_GET['delete_folder'])) {
+// Supprimer un dossier - uniquement si la table folders existe
+if ($folderTableExists && isset($_GET['delete_folder']) && is_numeric($_GET['delete_folder'])) {
     $folder_id = intval($_GET['delete_folder']);
     
-    // Vérifier que le dossier appartient à l'utilisateur
-    $checkStmt = $conn->prepare("SELECT id FROM folders WHERE id = ? AND user_id = ?");
-    $checkStmt->bind_param("ii", $folder_id, $userid);
-    $checkStmt->execute();
-    $checkStmt->store_result();
-    
-    if ($checkStmt->num_rows > 0) {
-        // Supprimer le dossier (les triggers de cascade supprimeront les fichiers et sous-dossiers)
-        $deleteStmt = $conn->prepare("DELETE FROM folders WHERE id = ?");
-        $deleteStmt->bind_param("i", $folder_id);
+    try {
+        // Vérifier que le dossier appartient à l'utilisateur
+        $checkStmt = $conn->prepare("SELECT id FROM folders WHERE id = ? AND user_id = ?");
+        $checkStmt->bind_param("ii", $folder_id, $userid);
+        $checkStmt->execute();
+        $checkStmt->store_result();
         
-        if ($deleteStmt->execute()) {
-            $messages[] = "<p id='delete-message' class='success-message'>Folder deleted successfully.</p>";
+        if ($checkStmt->num_rows > 0) {
+            // Supprimer le dossier (les triggers de cascade supprimeront les fichiers et sous-dossiers)
+            $deleteStmt = $conn->prepare("DELETE FROM folders WHERE id = ?");
+            $deleteStmt->bind_param("i", $folder_id);
             
-            // Si on vient de supprimer le dossier courant, rediriger vers le parent ou la racine
-            if ($folder_id == $current_folder_id) {
-                $parent_query = $conn->prepare("SELECT parent_folder_id FROM folders WHERE id = ?");
-                $parent_query->bind_param("i", $current_folder_id);
-                $parent_query->execute();
-                $parent_query->bind_result($parent_id);
-                $parent_query->fetch();
-                $parent_query->close();
+            if ($deleteStmt->execute()) {
+                $messages[] = "<p id='delete-message' class='success-message'>Folder deleted successfully.</p>";
                 
-                if ($parent_id) {
-                    header("Location: home.php?folder_id=" . $parent_id);
-                } else {
-                    header("Location: home.php");
+                // Si on vient de supprimer le dossier courant, rediriger vers le parent ou la racine
+                if ($folder_id == $current_folder_id) {
+                    $parent_query = $conn->prepare("SELECT parent_folder_id FROM folders WHERE id = ?");
+                    $parent_query->bind_param("i", $current_folder_id);
+                    $parent_query->execute();
+                    $parent_query->bind_result($parent_id);
+                    $parent_query->fetch();
+                    $parent_query->close();
+                    
+                    if ($parent_id) {
+                        header("Location: home.php?folder_id=" . $parent_id);
+                    } else {
+                        header("Location: home.php");
+                    }
+                    exit();
                 }
-                exit();
+            } else {
+                throw new Exception("Error deleting folder: " . $conn->error);
             }
         } else {
-            $messages[] = "<p id='delete-message' class='error-message'>Error deleting folder: " . $conn->error . "</p>";
+            $messages[] = "<p id='delete-message' class='error-message'>You don't have permission to delete this folder.</p>";
         }
-    } else {
-        $messages[] = "<p id='delete-message' class='error-message'>You don't have permission to delete this folder.</p>";
+    } catch (Exception $e) {
+        $messages[] = "<p id='delete-message' class='error-message'>" . $e->getMessage() . "</p>";
     }
 }
 
@@ -226,84 +290,115 @@ function getFolderBreadcrumb($conn, $folder_id, $userid) {
     $breadcrumb = [];
     $current_id = $folder_id;
     
-    while ($current_id) {
-        $stmt = $conn->prepare("SELECT id, folder_name, parent_folder_id FROM folders WHERE id = ? AND user_id = ?");
-        $stmt->bind_param("ii", $current_id, $userid);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result->num_rows > 0) {
-            $folder = $result->fetch_assoc();
-            array_unshift($breadcrumb, ['id' => $folder['id'], 'name' => $folder['folder_name']]);
-            $current_id = $folder['parent_folder_id'];
-        } else {
-            break;
+    try {
+        while ($current_id) {
+            $stmt = $conn->prepare("SELECT id, folder_name, parent_folder_id FROM folders WHERE id = ? AND user_id = ?");
+            $stmt->bind_param("ii", $current_id, $userid);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows > 0) {
+                $folder = $result->fetch_assoc();
+                array_unshift($breadcrumb, ['id' => $folder['id'], 'name' => $folder['folder_name']]);
+                $current_id = $folder['parent_folder_id'];
+            } else {
+                break;
+            }
         }
+    } catch (Exception $e) {
+        // Return empty breadcrumb in case of error
     }
     
     return $breadcrumb;
 }
 
-// Récupérer les informations sur le dossier actuel
+// Initialiser les variables pour la navigation dans les dossiers
 $current_folder_name = "My Drive";
 $parent_folder_id = null;
+$folders = [];
+$breadcrumb = [];
 
-if ($current_folder_id) {
-    $stmt = $conn->prepare("SELECT folder_name, parent_folder_id FROM folders WHERE id = ? AND user_id = ?");
-    $stmt->bind_param("ii", $current_folder_id, $userid);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    
-    if ($result->num_rows > 0) {
-        $folder = $result->fetch_assoc();
-        $current_folder_name = $folder['folder_name'];
-        $parent_folder_id = $folder['parent_folder_id'];
-    } else {
-        // Rediriger vers le dossier racine si le dossier n'existe pas ou n'appartient pas à l'utilisateur
-        header("Location: home.php");
-        exit();
+// Récupérer les informations sur le dossier actuel - uniquement si la table folders existe
+if ($folderTableExists && $current_folder_id) {
+    try {
+        $stmt = $conn->prepare("SELECT folder_name, parent_folder_id FROM folders WHERE id = ? AND user_id = ?");
+        $stmt->bind_param("ii", $current_folder_id, $userid);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if ($result->num_rows > 0) {
+            $folder = $result->fetch_assoc();
+            $current_folder_name = $folder['folder_name'];
+            $parent_folder_id = $folder['parent_folder_id'];
+            
+            // Générer le fil d'Ariane
+            $breadcrumb = getFolderBreadcrumb($conn, $current_folder_id, $userid);
+        } else {
+            // Rediriger vers le dossier racine si le dossier n'existe pas ou n'appartient pas à l'utilisateur
+            header("Location: home.php");
+            exit();
+        }
+    } catch (Exception $e) {
+        $messages[] = "<p class='error-message'>" . $e->getMessage() . "</p>";
     }
 }
 
-// Récupérer les sous-dossiers du dossier actuel
-$folders = [];
-$stmt = $conn->prepare("SELECT id, folder_name, created_at FROM folders WHERE user_id = ? AND parent_folder_id " . ($current_folder_id ? "= ?" : "IS NULL") . " ORDER BY folder_name");
-
-if ($current_folder_id) {
-    $stmt->bind_param("ii", $userid, $current_folder_id);
-} else {
-    $stmt->bind_param("i", $userid);
-}
-
-$stmt->execute();
-$result = $stmt->get_result();
-
-while ($row = $result->fetch_assoc()) {
-    $folders[] = $row;
+// Récupérer les sous-dossiers du dossier actuel - uniquement si la table folders existe
+if ($folderTableExists) {
+    try {
+        $query = "SELECT id, folder_name, created_at FROM folders WHERE user_id = ? AND parent_folder_id ";
+        $query .= $current_folder_id ? "= ? " : "IS NULL ";
+        $query .= "ORDER BY folder_name";
+        
+        $stmt = $conn->prepare($query);
+        
+        if ($current_folder_id) {
+            $stmt->bind_param("ii", $userid, $current_folder_id);
+        } else {
+            $stmt->bind_param("i", $userid);
+        }
+        
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        while ($row = $result->fetch_assoc()) {
+            $folders[] = $row;
+        }
+    } catch (Exception $e) {
+        // Continue with empty folders array
+    }
 }
 
 // Récupérer les fichiers du dossier actuel
 $files = [];
-$stmt = $conn->prepare("SELECT id, filename, file_size, file_type, created_at FROM files WHERE user_id = ? AND folder_id " . ($current_folder_id ? "= ?" : "IS NULL") . " ORDER BY filename");
-
-if ($current_folder_id) {
-    $stmt->bind_param("ii", $userid, $current_folder_id);
-} else {
-    $stmt->bind_param("i", $userid);
+try {
+    $query = "SELECT id, filename, file_size, file_type, created_at FROM files WHERE user_id = ? ";
+    
+    // Ajouter la condition de dossier si la colonne existe
+    if ($folderIdColumnExists) {
+        $query .= "AND folder_id " . ($current_folder_id ? "= ? " : "IS NULL ");
+    }
+    
+    $query .= "ORDER BY filename";
+    
+    $stmt = $conn->prepare($query);
+    
+    if ($folderIdColumnExists && $current_folder_id) {
+        $stmt->bind_param("ii", $userid, $current_folder_id);
+    } else {
+        $stmt->bind_param("i", $userid);
+    }
+    
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    while ($row = $result->fetch_assoc()) {
+        $files[] = $row;
+    }
+} catch (Exception $e) {
+    $messages[] = "<p class='error-message'>Error loading files: " . $e->getMessage() . "</p>";
 }
 
-$stmt->execute();
-$result = $stmt->get_result();
-
-while ($row = $result->fetch_assoc()) {
-    $files[] = $row;
-}
-
-// Générer le fil d'Ariane
-$breadcrumb = [];
-if ($current_folder_id) {
-    $breadcrumb = getFolderBreadcrumb($conn, $current_folder_id, $userid);
-}
 ?>
 
 <!DOCTYPE html>
@@ -487,6 +582,14 @@ if ($current_folder_id) {
             margin-bottom: 20px;
         }
         
+        .info-message {
+            background-color: #dbeafe;
+            color: #1e40af;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
         .storage-bar-container {
             width: 100%;
             background-color: #e5e7eb;
@@ -513,6 +616,20 @@ if ($current_folder_id) {
         @media (max-width: 768px) {
             .folder-container {
                 grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            }
+            
+            .folder-actions-container {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            
+            .folder-form {
+                margin-top: 10px;
+                width: 100%;
+            }
+            
+            .folder-form input[type="text"] {
+                width: 100%;
             }
         }
     </style>
@@ -561,6 +678,7 @@ if ($current_folder_id) {
             <?= $message ?>
         <?php endforeach; ?>
         
+        <?php if ($folderTableExists): ?>
         <!-- Breadcrumb Navigation -->
         <div class="breadcrumb">
             <a href="home.php">📁 Root</a>
@@ -578,6 +696,7 @@ if ($current_folder_id) {
                 <button type="submit">Create Folder</button>
             </form>
         </div>
+        <?php endif; ?>
         
         <!-- File Upload Form -->
         <div class="upload-container">
@@ -588,24 +707,24 @@ if ($current_folder_id) {
             </form>
         </div>
         
+        <?php if ($folderTableExists && !empty($folders)): ?>
         <!-- Folders Section -->
-        <?php if (!empty($folders)): ?>
-            <div class="section-title">
-                <span>📁</span> Folders
-            </div>
-            <div class="folder-container">
-                <?php foreach ($folders as $folder): ?>
-                    <div class="folder-item">
-                        <div class="folder-icon">📁</div>
-                        <div class="folder-name"><?= htmlspecialchars($folder['folder_name']) ?></div>
-                        <div class="file-details">Created: <?= date('M d, Y', strtotime($folder['created_at'])) ?></div>
-                        <div class="folder-actions">
-                            <a href="home.php?folder_id=<?= $folder['id'] ?>" class="action-btn">Open</a>
-                            <a href="home.php?delete_folder=<?= $folder['id'] ?><?= $current_folder_id ? '&folder_id='.$current_folder_id : '' ?>" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this folder and all its contents?');">Delete</a>
-                        </div>
+        <div class="section-title">
+            <span>📁</span> Folders
+        </div>
+        <div class="folder-container">
+            <?php foreach ($folders as $folder): ?>
+                <div class="folder-item">
+                    <div class="folder-icon">📁</div>
+                    <div class="folder-name"><?= htmlspecialchars($folder['folder_name']) ?></div>
+                    <div class="file-details">Created: <?= date('M d, Y', strtotime($folder['created_at'])) ?></div>
+                    <div class="folder-actions">
+                        <a href="home.php?folder_id=<?= $folder['id'] ?>" class="action-btn">Open</a>
+                        <a href="home.php?delete_folder=<?= $folder['id'] ?><?= $current_folder_id ? '&folder_id='.$current_folder_id : '' ?>" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this folder and all its contents?');">Delete</a>
                     </div>
-                <?php endforeach; ?>
-            </div>
+                </div>
+            <?php endforeach; ?>
+        </div>
         <?php endif; ?>
         
         <!-- Files Section -->
@@ -626,7 +745,7 @@ if ($current_folder_id) {
                         } elseif (strpos($file['file_type'], 'audio/') === 0) {
                             $icon = '🎵'; // Audio
                         } elseif (strpos($file['file_type'], 'application/pdf') === 0) {
-                            $icon = '📕'; // PDF
+                            $icon = '$icon = '📕'; // PDF
                         } elseif (strpos($file['file_type'], 'application/zip') === 0 || strpos($file['file_type'], 'application/x-rar') === 0) {
                             $icon = '🗜️'; // Archive
                         } elseif (strpos($file['file_type'], 'application/msword') === 0 || strpos($file['file_type'], 'application/vnd.openxmlformats-officedocument.wordprocessingml') === 0) {
@@ -642,7 +761,7 @@ if ($current_folder_id) {
                         <div class="file-icon"><?= $icon ?></div>
                         <div class="file-name"><?= htmlspecialchars($file['filename']) ?></div>
                         <div class="file-details"><?= number_format($file['file_size'] / 1024, 2) ?> KB</div>
-                        <div class="file-details">Created: <?= date('M d, Y', strtotime($file['created_at'])) ?></div>
+                        <div class="file-details">Created: <?= date('M d, Y', strtotime($file['created_at'] ?? 'now')) ?></div>
                         <div class="file-actions">
                             <a href="download.php?id=<?= $file['id'] ?>" class="action-btn">Download</a>
                             <a href="home.php?delete_id=<?= $file['id'] ?><?= $current_folder_id ? '&folder_id='.$current_folder_id : '' ?>" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this file?');">Delete</a>
